@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Coroutine
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HassJob, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 import paho.mqtt.client as mqtt
 
@@ -28,9 +28,9 @@ class MQTTClient:
         self._lock = asyncio.Lock()
 
         self.subscribe_topics: list[str] = []
-        self.on_message: Callable[[mqtt.MQTTMessage], Coroutine[Any, Any, None]] | None = None
-        self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
-        self.on_disconnect: Callable[[], Coroutine[Any, Any, None]] | None = None
+        self._on_message_job: HassJob[[mqtt.MQTTMessage], Coroutine[Any, Any, None]] | None = None
+        self._on_connect_job: HassJob[[], Coroutine[Any, Any, None]] | None = None
+        self._on_disconnect_job: HassJob[[], Coroutine[Any, Any, None]] | None = None
 
         if username and password:
             self._client.username_pw_set(username, password)
@@ -63,6 +63,30 @@ class MQTTClient:
     def connected(self) -> bool:
         return self._client.is_connected()
 
+    @property
+    def on_message(self) -> Callable[[mqtt.MQTTMessage], Coroutine[Any, Any, None]] | None:
+        return self._on_message_job.target if self._on_message_job else None
+
+    @on_message.setter
+    def on_message(self, target: Callable[[mqtt.MQTTMessage], Coroutine[Any, Any, None]] | None) -> None:
+        self._on_message_job = HassJob(target, "airmx mqtt on_message") if target else None
+
+    @property
+    def on_connect(self) -> Callable[[], Coroutine[Any, Any, None]] | None:
+        return self._on_connect_job.target if self._on_connect_job else None
+
+    @on_connect.setter
+    def on_connect(self, target: Callable[[], Coroutine[Any, Any, None]] | None) -> None:
+        self._on_connect_job = HassJob(target, "airmx mqtt on_connect") if target else None
+
+    @property
+    def on_disconnect(self) -> Callable[[], Coroutine[Any, Any, None]] | None:
+        return self._on_disconnect_job.target if self._on_disconnect_job else None
+
+    @on_disconnect.setter
+    def on_disconnect(self, target: Callable[[], Coroutine[Any, Any, None]] | None) -> None:
+        self._on_disconnect_job = HassJob(target, "airmx mqtt on_disconnect") if target else None
+
     def _mqtt_on_connect(
         self,
         _mqttc: mqtt.Client,
@@ -77,8 +101,13 @@ class MQTTClient:
             _LOGGER.info(f"Subscribe to {topic}")
             self._client.subscribe(topic)
 
-        if self.on_connect is not None:
-            self._hass.add_job(self.on_connect())
+        # Called from the paho network thread: hand control over to the event loop
+        self._hass.loop.call_soon_threadsafe(self._async_handle_connect)
+
+    @callback
+    def _async_handle_connect(self) -> None:
+        if self._on_connect_job is not None:
+            self._hass.async_run_hass_job(self._on_connect_job)
 
     def _mqtt_on_disconnect(
         self,
@@ -89,14 +118,22 @@ class MQTTClient:
     ) -> None:
         _LOGGER.info(f"Disconnected from MQTT server ({result_code})")
 
-        if self.on_disconnect:
-            self._hass.add_job(self.on_disconnect())
+        self._hass.loop.call_soon_threadsafe(self._async_handle_disconnect)
+
+    @callback
+    def _async_handle_disconnect(self) -> None:
+        if self._on_disconnect_job is not None:
+            self._hass.async_run_hass_job(self._on_disconnect_job)
 
     def _mqtt_on_message(self, _mqttc: mqtt.Client, _userdata: None, msg: mqtt.MQTTMessage) -> None:
         _LOGGER.debug(f"Received from MQTT: {msg.payload!r}")
 
-        if self.on_message:
-            self._hass.add_job(self.on_message(msg))
+        self._hass.loop.call_soon_threadsafe(self._async_handle_message, msg)
+
+    @callback
+    def _async_handle_message(self, msg: mqtt.MQTTMessage) -> None:
+        if self._on_message_job is not None:
+            self._hass.async_run_hass_job(self._on_message_job, msg)
 
     @staticmethod
     def _raise_on_error(result_code: int) -> None:
